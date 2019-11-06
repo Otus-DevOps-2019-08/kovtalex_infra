@@ -5,5 +5,13 @@
 .terraform/
 *.retry
 jdauphant.nginx
+ansible/roles/db/
 vault.key
 *.bak
+# Vagrant & molecule
+.vagrant/
+*.log
+*.pyc
+.molecule
+.cache
+.pytest_cache

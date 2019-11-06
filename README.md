@@ -2,6 +2,362 @@
 
 [![Build Status](https://travis-ci.com/Otus-DevOps-2019-08/kovtalex_infra.svg?branch=master)](https://travis-ci.com/Otus-DevOps-2019-08/kovtalex_infra)
 
+## Локальная разработка с Vagrant
+
+### Установка Vagrant
+
+https://www.vagrantup.com/downloads.html скачиваем и устанавливаем в /usr/local/bin
+
+Проверяем установку: vagrant -v
+
+Так как на Ubuntu в виртуалке не завелся VirtualBox, пришлось воспользоваться libvirt и установить Vagrant через apt.
+
+Перед началом работы с Vagrant и Molecule обновим наш .gitignore:
+
+```
+.gitignore
+... <- предыдущие записи
+# Vagrant & molecule
+.vagrant/
+*.log
+*.pyc
+.molecule
+.cache
+.pytest_cache
+```
+
+### Далее опишем локальную инфраструктуру, которую использовали в GCE и применим на своей локальной машине, используя Vagrant и libvirt
+
+Vagrantfile:
+```
+Vagrant.configure("2") do |config|
+
+  config.vm.provider :libvirt do |v|
+    v.memory = 512
+  end
+
+
+  config.vm.define "dbserver" do |db|
+    db.vm.box = "generic/ubuntu1604"
+    db.vm.hostname = "dbserver"
+    db.vm.network :private_network, ip: "10.10.10.10"
+    
+    db.vm.provision "ansible" do |ansible|
+      ansible.playbook = "playbooks/site.yml"
+      ansible.groups = {
+      "db" => ["dbserver"],
+      "db:vars" => {"mongo_bind_ip" => "0.0.0.0"}
+      }
+    end
+  end
+
+  config.vm.define "appserver" do |app|
+    app.vm.box = "generic/ubuntu1604"
+    app.vm.hostname = "appserver"
+    app.vm.network :private_network, ip: "10.10.10.20"
+
+    app.vm.provision "ansible" do |ansible|
+      ansible.playbook = "playbooks/site.yml"
+      ansible.groups = {
+      "app" => ["appserver"],
+      "app:vars" => { "db_host" => "10.10.10.10"}
+      }
+      ansible.extra_vars = {
+        "deploy_user" => "vagrant",
+        "nginx_sites" => {
+          "default" => [
+            "listen 80",
+            "server_name \"reddit\"",
+            "location / {
+              proxy_pass http://127.0.0.1:9292;
+            }"
+          ]
+        }
+      }
+    end
+  end
+end
+```
+
+Образ generic/ubuntu1604 для libvirt скачивается из Vagrant Cloud - главного хранилища Vagrant боксов.
+
+Команды:
+- vagrant up - создание VM и провижининг
+- vagrant box list - просмотр списка скаченных боксов для наших VM
+- vagrant status - просмотр статуса VM
+- vagrant ssh appserver - подключение к VM по SSH
+- vagrant provision dbserver - запуск провижинера
+- cat .vagrant/provisioners/ansible/inventory/vagrant_ansible_inventory - просмотр сформированного инвентори
+
+При выполнении vagrant up с libvirt не стартует один из провижинеров, поэтому указываем аргумент --no-parallel, для последовательного выполнения развертывания:
+vagrant up --no-parallel
+
+### Доработка ролей
+
+Вынесем для роли db:
+- задачи по установке Mongo DB в ansible/roles/db/tasks/install_mongo.yml
+- задачи по настройке Mongo DB в ansible/roles/db/tasks/config_mongo.yml
+- запуск этих задач из ansible/roles/db/tasks/main.yml
+
+Вынесем для роли app:
+- задачи по установке Ruby в ansible/roles/app/tasks/ruby.yml
+- задачи по настройке Puma в ansible/roles/app/tasks/puma.yml
+- запуск этих задач из ansible/roles/app/tasks/main.yml
+
+Также введем переопределение имени пользовавателя в нашем боксе. Для этого воспользуемся переменными, имеющими самый высокий приоритет по сравнению со всеми остальными (extra_vars):
+
+```
+Vagrantfile:
+ansible.extra_vars = {
+  "deploy_user" => "vagrant",
+  ...
+```
+
+Заменим все упоминания о appuser на {{ deploy_user }} в наших тасках, шаблоне и проверим работу приложения по адресу app хоста: 10.10.10.20:9292
+
+В случае, если vagrant provision падает с ошибкой из-за невозможности записать в директорию /home/<имя пользователя>, проверим под каким
+пользователем Vagrant выполняет плейбуки.
+
+Задание со *
+
+Дополним в Vagrantfile раздел exra_vars для передачи параметров конфигурации nginx:
+```
+ansible.extra_vars = {
+  "nginx_sites" => {
+    "default" => [
+      "listen 80",
+      "server_name \"reddit\"",
+      "location / {
+        proxy_pass http://127.0.0.1:9292;
+      }"
+    ]
+}
+```
+и проверим работу приложения по адресу app хоста: 10.10.10.20:80
+
+### Тестирование ролей с помощью Molecule и Testinfra
+
+Для начала добавим все необходимые компоненты для тестирования в requirements.txt и установим их: pip install -r requirements.txt (используем venv):
+
+```
+molecule>=2.6
+testinfra>=1.10
+python-vagrant>=0.5.15
+```
+
+Проверим версию molecule: molecule --version 
+
+Используем команду molecule init для создания заготовки тестов роли db в директории ansible/roles/db:
+
+molecule init scenario --scenario-name default -r db -d vagrant
+
+Добавим несколько тестов, используя модули Testinfra для проверки конфигурации, настраиваемой ролью db:
+
+db/molecule/default/test_default.py
+```
+import os
+
+import testinfra.utils.ansible_runner
+
+testinfra_hosts = testinfra.utils.ansible_runner.AnsibleRunner(
+    os.environ['MOLECULE_INVENTORY_FILE']).get_hosts('all')
+
+
+# check if MongoDB is enabled and running
+def test_mongo_running_and_enabled(host):
+    mongo = host.service("mongod")
+    assert mongo.is_running
+    assert mongo.is_enabled
+
+
+# check if configuration file contains the required line
+def test_config_file(host):
+    config_file = host.file('/etc/mongod.conf')
+    assert config_file.contains('bindIp: 0.0.0.0')
+    assert config_file.is_file
+```
+
+Опишем тестовую машину db/molecule/default/molecule.yml:
+
+```
+---
+dependency:
+  name: galaxy
+driver:
+  name: vagrant
+  provider:
+    name: libvirt
+lint:
+  name: yamllint
+platforms:
+  - name: instance
+    box: generic/ubuntu1604
+provisioner:
+  name: ansible
+  lint:
+    name: ansible-lint
+verifier:
+  name: testinfra
+  lint:
+    name: flake8
+```
+
+и создадим ее: molecule create
+
+Просмотр списка VM, которыми управляет Molecule: molecule list 
+
+Подключение к VM по SSH для проверки ее работы: molecule login -h instance
+
+Также дополним наш db/molecule/default/playbook.yml:
+
+```
+---
+- name: Converge
+  become: true
+  hosts: all
+  vars:
+    mongo_bind_ip: 0.0.0.0
+  roles:
+    - role: db
+```
+
+Применим конфигурацию: molecule converge и прогоним тесты: molecule verify
+
+Об успешном прохождении тестов будет свидетельствовать сообщение: Verifier completed successfully.
+
+Дополним наш тест проверкой того, что БД слушает порт 27017:
+
+db/molecule/default/test_default.py
+```
+# check if mongo port 27017 is listening
+def test_mongo_port_listening(host):
+    mongo_port = host.socket('tcp://27017')
+    assert mongo_port.is_listening
+```
+
+Исправим наши роли и шаблоны Packer для использования ролей db и app совместно с тегами:
+
+ansible/playbooks/packer_db.yml
+
+```
+- { role:  db }
+```
+
+ansible/playbooks/packer_app.yml
+
+```
+- { role:  app }
+```
+
+packer/db.json:
+
+```
+"provisioners": [
+  {
+    "type": "ansible",
+    "playbook_file": "ansible/playbooks/packer_db.yml",
+    "extra_arguments": ["--tags","mongo"],
+    "ansible_env_vars": ["ANSIBLE_ROLES_PATH={{ pwd }}/ansible/roles"]
+  }
+]
+```
+
+packer/app.json:
+
+```
+"provisioners": [
+  {
+    "type": "ansible",
+    "playbook_file": "ansible/playbooks/packer_app.yml",
+    "extra_arguments": ["--tags","ruby"],
+    "ansible_env_vars": ["ANSIBLE_ROLES_PATH={{ pwd }}/ansible/roles"]
+  }
+]
+```
+
+ansible/roles/db/main.yml (теги)
+
+```
+- include: install_mongo.yml
+  tags:
+    - mongo
+```
+
+ansible/roles/app/main.yml (теги):
+
+```
+- include: ruby.yml
+  tags:
+    - ruby
+- include: puma.yml
+  tags:
+    - puma
+```
+
+### Задание со *
+
+Вынесем роль db в отдельный репозитарий:
+- добавим ansible/roles/db/ в .gitignore в осном репозитории обучения
+- Вынесем роль db в отдельный репозитарий kovtalex/ansible-role-db и подключим через requirements.yml обоих окружений:
+
+```
+- name: db
+  src: https://github.com/kovtalex/ansible-role-db
+```
+
+Для репозитария ansible-role-db и роли db подключим Travis CI для автоматического прогона тестов на GCE.
+
+Пример роли: https://github.com/Artemmkin/db-role-example
+
+Пройдем шаги ниже:
+- добавим в .gitignore следующее:
+```
+*.log
+*.tar
+*.pub
+credentials.json
+google_compute_engine
+```
+- wget https://raw.githubusercontent.com/vitkhab/gce_test/c98d97ea79bacad23fd26106b52dee0d21144944/.travis.yml
+- ssh-keygen -t rsa -f google_compute_engine -C 'travis' -q -N '' (генерируем ключ для подключения по SSH)
+- добавим открытый ключ в meta данные в GCP
+- используем key.json -> credentials.json из прошлого ДЗ и скопируем в корень репозитория
+- выполним команды шифрования переменных:
+```
+travis encrypt GCE_SERVICE_ACCOUNT_EMAIL='993674103918-compute@developer.gserviceaccount.com' --add --com
+travis encrypt GCE_CREDENTIALS_FILE="$(pwd)/credentials.json" --add --com
+travis encrypt GCE_PROJECT_ID='infra-253207' --add --com
+```
+- зашифруем файлы:
+```
+tar cvf secrets.tar credentials.json google_compute_engine
+travis login
+travis encrypt-file secrets.tar --add --com
+```
+- пушим и проверяем изменения:
+```
+git commit -m 'Added Travis integration'
+git push
+```
+- в molecule/gce/playbook.yml меняет имя роли на: "{{ lookup('env', 'MOLECULE_PROJECT_DIRECTORY') | basename }}"
+- в molecule/gce/molecule.yml меняем имя образа на один из последних: ubuntu-1604-xenial-v20191024
+- в .travis.yml для настройки оповещения о билде в Slack chat добавляем секрет зашифрованный по команде:
+```
+travis encrypt "devops-team-otus:<token>#alexey_kovtunovich" --com --add notifications.slack.rooms
+```
+- в README.md добавляем бейдж со статусом билда
+- также правим в .travis.yml:
+```
+install:
+- pip install ansible==2.8.6 molecule[gce] apache-libcloud ([gce] - указываем использовать соответсвующий драйвер)
+script:
+- molecule test --scenario-name gce (указываем имя нашего сценария)
+after_script:
+- molecule destroy --scenario-name gce (указываем имя нашего сценария)
+```
+Также можно использовать --debug для включения отладочной информации.
+
+
 ## Ansible: работа с ролями и окружениями
 
 ### Переносим созданные плейбуки в раздельные роли
@@ -126,7 +482,7 @@ ansible-playbook -i environments/prod/inventory.gcp.yml playbooks/site.yml - б�
 
 Было выполнено:
 - в .travis.yml дописаны команды установки terraform, packer, tflint, ansible-lint
-- для terraform init и подключению к GCS для state реализовано хранение access_token в шифрованной переменной Travis, добавляемой через web интерфейс Travis
+- для terraform init и подключению к GCS для state реализовано хранение access_token в шифрованной переменной Travis, добавляемой через web интерфейс Travis (gcloud auth application-default print-access-token)
 - в .travis.yml добавлена команда запуска скрипта (выполняется только для коммитов в master и PR) для:
 ```
 packer validate для всех шаблонов
